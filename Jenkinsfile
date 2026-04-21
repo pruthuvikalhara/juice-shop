@@ -21,7 +21,6 @@ pipeline {
                 }
                 stage('SAST (Pro Semgrep)') {
                     steps {
-                        // Simplified config to ensure rule-sets are found
                         sh '''
                             semgrep scan \
                                 --config p/security-audit \
@@ -36,10 +35,9 @@ pipeline {
                 }
                 stage('SCA (Dependency Check)') {
                     steps {
-                        // Removed the unsupported --connectionTimeout flag
                         sh """
                             ${ODC_HOME}/bin/dependency-check.sh \
-                                --project 'Universal-Scan' \
+                                --project 'Juice-Shop-Analysis' \
                                 --scan . \
                                 --format 'ALL' \
                                 --out . \
@@ -54,7 +52,7 @@ pipeline {
         stage('SonarQube Global Analysis') {
             steps {
                 withSonarQubeEnv('SonarQube-Server') {
-                    // FIXED: Replaced ${JOB_NAME} with a hardcoded key "SAST-Pipeline-Project" to avoid space errors
+                    // Using a distinct project key for Juice Shop to keep results clean
                     sh "${SCANNER_HOME}/bin/sonar-scanner \
                         -Dsonar.projectKey='SAST-Pipeline-Project' \
                         -Dsonar.sources=. \
@@ -65,8 +63,19 @@ pipeline {
 
         stage("Quality Gate Enforcement") {
             steps {
-                timeout(time: 30, unit: 'MINUTES') {
-                    waitForQualityGate abortPipeline: true
+                // Increased timeout to ensure Juice Shop background processing completes
+                timeout(time: 15, unit: 'MINUTES') {
+                    script {
+                        // This waits for the Webhook from SonarQube
+                        def qg = waitForQualityGate()
+                        
+                        // FAIL LOGIC: If status is not 'OK', the pipeline stops here
+                        if (qg.status != 'OK') {
+                            error "PIPELINE ABORTED: Security standards not met. Status: ${qg.status}. Check: http://localhost:9000"
+                        } else {
+                            echo "SUCCESS: Code meets professional security standards."
+                        }
+                    }
                 }
             }
         }
