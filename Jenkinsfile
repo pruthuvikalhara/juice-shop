@@ -2,7 +2,7 @@ pipeline {
     agent any
     
     triggers {
-        // This tells Jenkins to listen for the GitHub Webhook "push" event
+        // Automatically start the build when you push to GitHub
         githubPush()
     }
 
@@ -23,11 +23,13 @@ pipeline {
             parallel {
                 stage('Secret Scan') {
                     steps {
+                        // Detects leaked keys/passwords
                         sh 'gitleaks detect --source . --verbose --redact || true'
                     }
                 }
                 stage('SAST (Pro Semgrep)') {
                     steps {
+                        // Static analysis for code vulnerabilities
                         sh '''
                             semgrep scan \
                                 --config p/security-audit \
@@ -42,6 +44,7 @@ pipeline {
                 }
                 stage('SCA (Dependency Check)') {
                     steps {
+                        // Scans third-party libraries for known CVEs
                         sh """
                             ${ODC_HOME}/bin/dependency-check.sh \
                                 --project 'Juice-Shop-Analysis' \
@@ -71,11 +74,10 @@ pipeline {
             steps {
                 timeout(time: 15, unit: 'MINUTES') {
                     script {
+                        // Waits for SonarQube to finish processing Overall Code conditions
                         def qg = waitForQualityGate()
                         if (qg.status != 'OK') {
-                            error "PIPELINE ABORTED: Security standards not met. Status: ${qg.status}."
-                        } else {
-                            echo "SUCCESS: Code meets professional security standards."
+                            error "PIPELINE ABORTED: Security standards not met. Status: ${qg.status}. Vulnerabilities detected!"
                         }
                     }
                 }
@@ -85,8 +87,45 @@ pipeline {
 
     post {
         always {
+            script {
+                // --- AI SUMMARIZATION PART ---
+                if (fileExists('semgrep-report.txt')) {
+                    echo "--- Consulting AI Security Analyst for Final Outcome ---"
+                    
+                    // Pulling the most relevant 40 lines of the report
+                    def reportSnippet = sh(script: "head -n 40 semgrep-report.txt", returnStdout: true).trim()
+                    
+                    // Wrapping in try-catch so an AI error doesn't break artifact archiving
+                    try {
+                        withCredentials([string(credentialsId: 'GEMINI_API_KEY', variable: 'AI_KEY')]) {
+                            def response = sh(
+                                script: """
+                                curl -s -X POST 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${AI_KEY}' \
+                                     -H 'Content-Type: application/json' \
+                                     -d '{
+                                       "contents": [{
+                                         "parts":[{"text": "You are a DevSecOps expert. Summarize these results for King Banana. The pipeline failed. Explain the top 3 risks found in the code and a simple fix. Results: ${reportSnippet.replaceAll(/["\\]/, '')}"}]
+                                       }]
+                                     }'
+                                """,
+                                returnStdout: true
+                            )
+                            echo "========================================================="
+                            echo "                🤖 AI SECURITY OUTCOME                  "
+                            echo "========================================================="
+                            echo response
+                            echo "========================================================="
+                        }
+                    } catch (Exception e) {
+                        echo "AI Summary failed: ${e.message}"
+                    }
+                }
+            }
+            
+            // Archive the findings before the workspace is wiped
             archiveArtifacts artifacts: 'semgrep-report.txt, dependency-check-report.html, *.json, *.txt', allowEmptyArchive: true
-            // Best practice: Clean up the workspace to save disk space on your Ubuntu server
+            
+            // Cleanup workspace to keep the Ubuntu server clean
             cleanWs()
         }
     }
