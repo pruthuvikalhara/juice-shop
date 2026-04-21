@@ -69,7 +69,7 @@ For a detailed introduction, full list of features and architecture overview ple
    of the repository)
 3. Go into the cloned folder with `cd juice-shop`
 4. Run `npm install` (only has to be done before first start or when you change the source code)
-5. Run `npm start`
+5. Run `npm start sdfsdf`
 6. Browse to <http://localhost:3000>
 
 ### Packaged Distributions
