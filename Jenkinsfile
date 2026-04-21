@@ -1,10 +1,17 @@
 pipeline {
     agent any
+    
+    triggers {
+        // This tells Jenkins to listen for the GitHub Webhook "push" event
+        githubPush()
+    }
+
     environment {
         SCANNER_HOME = '/opt/sonar-scanner'
         ODC_HOME = '/opt/dependency-check'
         NVD_API_KEY = '8613479c-ad4f-4ed9-b39f-7346f723a600'
     }
+
     stages {
         stage('Universal Checkout') {
             steps { 
@@ -52,7 +59,6 @@ pipeline {
         stage('SonarQube Global Analysis') {
             steps {
                 withSonarQubeEnv('SonarQube-Server') {
-                    // Using a distinct project key for Juice Shop to keep results clean
                     sh "${SCANNER_HOME}/bin/sonar-scanner \
                         -Dsonar.projectKey='SAST-Pipeline-Project' \
                         -Dsonar.sources=. \
@@ -63,15 +69,11 @@ pipeline {
 
         stage("Quality Gate Enforcement") {
             steps {
-                // Increased timeout to ensure Juice Shop background processing completes
                 timeout(time: 15, unit: 'MINUTES') {
                     script {
-                        // This waits for the Webhook from SonarQube
                         def qg = waitForQualityGate()
-                        
-                        // FAIL LOGIC: If status is not 'OK', the pipeline stops here
                         if (qg.status != 'OK') {
-                            error "PIPELINE ABORTED: Security standards not met. Status: ${qg.status}. Check: http://localhost:9000"
+                            error "PIPELINE ABORTED: Security standards not met. Status: ${qg.status}."
                         } else {
                             echo "SUCCESS: Code meets professional security standards."
                         }
@@ -80,9 +82,12 @@ pipeline {
             }
         }
     }
+
     post {
         always {
             archiveArtifacts artifacts: 'semgrep-report.txt, dependency-check-report.html, *.json, *.txt', allowEmptyArchive: true
+            // Best practice: Clean up the workspace to save disk space on your Ubuntu server
+            cleanWs()
         }
     }
 }
