@@ -1,8 +1,10 @@
 pipeline {
     agent any
     
-    triggers {
-        githubPush()
+    options {
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '5'))
+        timestamps()
     }
 
     environment {
@@ -12,23 +14,23 @@ pipeline {
     }
 
     stages {
-        stage('Universal Checkout') {
-            steps { checkout scm }
+        stage('Checkout & Cleanup') {
+            steps {
+                cleanWs()
+                checkout scm
+            }
         }
 
-        stage('Multi-Tool Security Scan') {
+        stage('Security Scans') {
             parallel {
-                stage('Secret Scan') {
-                    steps { sh 'gitleaks detect --source . --verbose --redact || true' }
-                }
-                stage('SAST (Pro Semgrep)') {
+                stage('Semgrep SAST') {
                     steps {
-                        sh 'semgrep scan --config p/security-audit --config p/javascript --config p/nodejsscan --text --output=semgrep-report.txt || true'
+                        sh 'semgrep scan --config p/security-audit --text --output=semgrep-report.txt || true'
                     }
                 }
-                stage('SCA (Dependency Check)') {
+                stage('Gitleaks Secrets') {
                     steps {
-                        sh "${ODC_HOME}/bin/dependency-check.sh --project 'Juice-Shop' --scan . --format 'ALL' --out . --nvdApiKey ${NVD_API_KEY} || true"
+                        sh 'gitleaks detect --source . --verbose --redact || true'
                     }
                 }
             }
@@ -37,17 +39,16 @@ pipeline {
         stage('SonarQube Analysis') {
             steps {
                 withSonarQubeEnv('SonarQube-Server') {
-                    sh "${SCANNER_HOME}/bin/sonar-scanner -Dsonar.projectKey='SAST-Pipeline-Project' -Dsonar.sources=. -Dsonar.host.url=http://localhost:9000"
+                    sh "${SCANNER_HOME}/bin/sonar-scanner -Dsonar.projectKey='SAST-Pipeline-Project' -Dsonar.sources=."
                 }
             }
         }
 
-        stage("Quality Gate") {
+        stage("Quality Gate Wait") {
             steps {
                 timeout(time: 5, unit: 'MINUTES') {
                     script {
-                        def qg = waitForQualityGate()
-                        // Small sleep to ensure SonarQube API updates its database
+                        waitForQualityGate()
                         sh 'sleep 5' 
                     }
                 }
@@ -58,46 +59,49 @@ pipeline {
     post {
         always {
             script {
-                echo "--- Capturing Final Security Intel ---"
+                echo "--- Starting OpenAI Security Analysis ---"
                 
-                // 1. Better Data Extraction (Case-Insensitive 'High' or 'Critical')
-                def semgrepRaw = fileExists('semgrep-report.txt') ? sh(script: "grep -iE 'high|critical|error' semgrep-report.txt | head -n 15", returnStdout: true).trim() : "No report found."
-                
-                // 2. Capture SonarQube Status safely
+                // 1. Collect findings from the scanners
+                def semgrepRaw = fileExists('semgrep-report.txt') ? sh(script: "grep -iE 'high|critical|error' semgrep-report.txt | head -n 15", returnStdout: true).trim() : "No high-risk issues."
                 def sonarRaw = sh(script: "curl -s http://localhost:9000/api/qualitygates/project_status?projectKey=SAST-Pipeline-Project | jq -r '.projectStatus.status'", returnStdout: true).trim()
 
-                // 3. The Professional Prompt
+                // 2. The Prompt for OpenAI
                 def reportPrompt = """
-                Generate a professional HTML security dashboard for project 'Juice Shop'.
-                Current Status: SonarQube is ${sonarRaw}.
-                Findings: ${semgrepRaw}.
+                Generate a professional HTML security dashboard for 'King Banana'.
+                SonarQube Status: ${sonarRaw}
+                Semgrep Issues: ${semgrepRaw}
                 
                 Requirements:
-                - Use Tailwind CSS CDN.
-                - Theme: Slate-900 background.
-                - Sections: Dashboard Summary, Critical Vulnerabilities Table, and Remediation Code.
-                - Use professional badges (Red for Critical, Orange for High).
-                - Return ONLY the <html> code. No markdown.
+                - Use Tailwind CSS (CDN).
+                - Dark Theme (Slate-900).
+                - Sections: Dashboard Summary, Risk Table, and Detailed Fixes.
+                - Return ONLY the raw HTML code. Do not use markdown.
                 """.replaceAll(/["\\]/, '')
 
-                withCredentials([string(credentialsId: 'GEMINI_API_KEY', variable: 'AI_KEY')]) {
+                // 3. The OpenAI API Call
+                withCredentials([string(credentialsId: 'OPENAI_API_KEY', variable: 'OPENAI_KEY')]) {
                     sh """
-                    curl -s -X POST 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${AI_KEY}' \
-                         -H 'Content-Type: application/json' \
-                         -d '{"contents": [{"parts":[{"text": "${reportPrompt}"}]}]}' \
-                         | jq -r '.candidates[0].content.parts[0].text' \
+                    curl -s https://api.openai.com/v1/chat/completions \
+                      -H "Content-Type: application/json" \
+                      -H "Authorization: Bearer ${OPENAI_KEY}" \
+                      -d '{
+                        "model": "gpt-4o-mini",
+                        "messages": [{"role": "user", "content": "${reportPrompt}"}],
+                        "temperature": 0.7
+                      }' | jq -r '.choices[0].message.content' \
                          | sed 's/```html//g' | sed 's/```//g' > security-report.html
                     """
                 }
             }
             
+            // 4. Publish to the Jenkins Sidebar
             publishHTML([
                 allowMissing: false,
                 alwaysLinkToLastBuild: true,
                 keepAll: true,
                 reportDir: '.',
                 reportFiles: 'security-report.html',
-                reportName: 'AI Security Analysis'
+                reportName: 'AI Security Remediation'
             ])
 
             archiveArtifacts artifacts: '*.txt, *.html, *.json', allowEmptyArchive: true
