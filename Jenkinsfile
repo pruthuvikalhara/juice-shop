@@ -25,6 +25,7 @@ pipeline {
             parallel {
                 stage('Semgrep SAST') {
                     steps {
+                        // We use --text so grep can read it easily later
                         sh 'semgrep scan --config p/security-audit --text --output=semgrep-report.txt || true'
                     }
                 }
@@ -49,7 +50,8 @@ pipeline {
                 timeout(time: 5, unit: 'MINUTES') {
                     script {
                         waitForQualityGate()
-                        sh 'sleep 5' 
+                        // Sleep ensures the SonarQube Database is updated before we curl the API
+                        sh 'sleep 10' 
                     }
                 }
             }
@@ -59,26 +61,35 @@ pipeline {
     post {
         always {
             script {
-                echo "--- Starting OpenAI Security Analysis ---"
+                echo "--- DATA COLLECTION DEBUG ---"
                 
-                // 1. Collect findings from the scanners
-                def semgrepRaw = fileExists('semgrep-report.txt') ? sh(script: "grep -iE 'high|critical|error' semgrep-report.txt | head -n 15", returnStdout: true).trim() : "No high-risk issues."
-                def sonarRaw = sh(script: "curl -s http://localhost:9000/api/qualitygates/project_status?projectKey=SAST-Pipeline-Project | jq -r '.projectStatus.status'", returnStdout: true).trim()
+                // 1. Capture SonarQube Status with Fallback
+                def sonarStatus = sh(script: "curl -s http://localhost:9000/api/qualitygates/project_status?projectKey=SAST-Pipeline-Project | jq -r '.projectStatus.status' || echo 'PENDING'", returnStdout: true).trim()
+                echo "SonarQube Debug: Captured status is [${sonarStatus}]"
 
-                // 2. The Prompt for OpenAI
+                // 2. Capture Semgrep Findings with Fallback
+                def semgrepData = "No high-risk issues found."
+                if (fileExists('semgrep-report.txt')) {
+                    semgrepData = sh(script: "grep -iE 'high|critical|error|vulnerability' semgrep-report.txt | head -n 20", returnStdout: true).trim()
+                    if (semgrepData == "") { semgrepData = "Scan complete: No Critical/High issues detected in logs." }
+                }
+                echo "Semgrep Debug: Captured findings: ${semgrepData}"
+
+                // 3. Construct the OpenAI Prompt
                 def reportPrompt = """
-                Generate a professional HTML security dashboard for 'King Banana'.
-                SonarQube Status: ${sonarRaw}
-                Semgrep Issues: ${semgrepRaw}
+                Generate a professional HTML security dashboard for King Banana.
+                Project: Juice Shop
+                SonarQube Status: ${sonarStatus}
+                Semgrep Findings: ${semgrepData}
                 
                 Requirements:
                 - Use Tailwind CSS (CDN).
                 - Dark Theme (Slate-900).
-                - Sections: Dashboard Summary, Risk Table, and Detailed Fixes.
-                - Return ONLY the raw HTML code. Do not use markdown.
+                - Sections: Security Summary, Risk Table, and Remediation Plan.
+                - Return ONLY raw HTML code. No markdown or backticks.
                 """.replaceAll(/["\\]/, '')
 
-                // 3. The OpenAI API Call
+                // 4. OpenAI API Call
                 withCredentials([string(credentialsId: 'OPENAI_API_KEY', variable: 'OPENAI_KEY')]) {
                     sh """
                     curl -s https://api.openai.com/v1/chat/completions \
@@ -87,14 +98,14 @@ pipeline {
                       -d '{
                         "model": "gpt-4o-mini",
                         "messages": [{"role": "user", "content": "${reportPrompt}"}],
-                        "temperature": 0.7
+                        "temperature": 0.2
                       }' | jq -r '.choices[0].message.content' \
                          | sed 's/```html//g' | sed 's/```//g' > security-report.html
                     """
                 }
             }
             
-            // 4. Publish to the Jenkins Sidebar
+            // 5. Publish to Jenkins Sidebar
             publishHTML([
                 allowMissing: false,
                 alwaysLinkToLastBuild: true,
