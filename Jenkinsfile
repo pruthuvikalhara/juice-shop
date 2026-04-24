@@ -10,6 +10,8 @@ pipeline {
     environment {
         SCANNER_HOME = '/opt/sonar-scanner'
         ODC_HOME = '/opt/dependency-check'
+        // Note: Move secrets like NVD_API_KEY to Jenkins Credentials for better security later
+        NVD_API_KEY = '8613479c-ad4f-4ed9-b39f-7346f723a600'
     }
 
     stages {
@@ -20,22 +22,37 @@ pipeline {
             }
         }
 
-        stage('Security Scans (Skipped for Testing)') {
-            steps {
-                script {
-                    echo "Skipping real scans to save time..."
-                    // We create dummy files so the 'post' block has something to read
-                    sh "echo 'DUMMY SEMGREP DATA: XSS Found in navbar.html' > semgrep-report.txt"
-                    sh "echo 'DUMMY GITLEAKS DATA: Secret found in Jenkinsfile' > gitleaks-report.txt"
+        stage('Security Scans') {
+            parallel {
+                stage('Semgrep SAST') {
+                    steps {
+                        sh 'semgrep scan --config p/security-audit --text --output=semgrep-report.txt || true'
+                    }
+                }
+                stage('Gitleaks Secrets') {
+                    steps {
+                        sh 'gitleaks detect --source . --verbose --redact > gitleaks-report.txt || true'
+                    }
                 }
             }
         }
 
-        stage('SonarQube (Skipped for Testing)') {
+        stage('SonarQube Analysis') {
             steps {
-                echo "Skipping SonarQube analysis..."
-                // We don't need to do anything here; the 'post' block will 
-                // still try to curl the API to get the last known status.
+                withSonarQubeEnv('SonarQube-Server') {
+                    sh "${SCANNER_HOME}/bin/sonar-scanner -Dsonar.projectKey='SAST-Pipeline-Project' -Dsonar.sources=."
+                }
+            }
+        }
+
+        stage("Quality Gate Wait") {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    script {
+                        waitForQualityGate()
+                        sh 'sleep 10' 
+                    }
+                }
             }
         }
     }
@@ -43,54 +60,68 @@ pipeline {
     post {
         always {
             script {
-                echo "--- STEP 1: CONSOLIDATING DATA ---"
-                sh "echo '========================================' > combined-security-report.txt"
-                sh "echo 'KING BANANA CONSOLIDATED SECURITY REPORT' >> combined-security-report.txt"
-                sh "echo '========================================\n' >> combined-security-report.txt"
+                echo "--- STEP 1: CONSOLIDATING ALL SECURITY DATA ---"
+                
+                // Initialize the master report file
+                sh """
+                echo '========================================' > combined-security-report.txt
+                echo 'KING BANANA MASTER SECURITY REPORT' >> combined-security-report.txt
+                echo 'Generated: \$(date)' >> combined-security-report.txt
+                echo '========================================\n' >> combined-security-report.txt
+                """
 
-                // Add SonarQube (This will still pull the last result from your server)
-                sh "echo '[SECTION 1: SONARQUBE STATUS]' >> combined-security-report.txt"
+                // 1. Pull SonarQube Quality Gate Status
+                sh "echo '[SECTION 1: SONARQUBE METRICS]' >> combined-security-report.txt"
                 try {
                     withCredentials([string(credentialsId: 'sonar-token', variable: 'S_TOKEN')]) {
                         sh "curl -u ${S_TOKEN}: -s 'http://localhost:9000/api/qualitygates/project_status?projectKey=SAST-Pipeline-Project' | jq '.' >> combined-security-report.txt"
                     }
                 } catch (Exception e) {
-                    sh "echo 'Failed to fetch SonarQube data' >> combined-security-report.txt"
+                    sh "echo 'SonarQube data could not be retrieved.' >> combined-security-report.txt"
                 }
 
-                // Add Semgrep (Using the dummy file we created above)
+                // 2. Append Semgrep Findings
                 sh "echo '\n[SECTION 2: SEMGREP SAST FINDINGS]' >> combined-security-report.txt"
-                if (fileExists('semgrep-report.txt')) { sh "cat semgrep-report.txt >> combined-security-report.txt" }
+                if (fileExists('semgrep-report.txt')) {
+                    sh "cat semgrep-report.txt >> combined-security-report.txt"
+                }
 
-                // Add Gitleaks (Using the dummy file we created above)
+                // 3. Append Gitleaks Findings
                 sh "echo '\n[SECTION 3: GITLEAKS SECRET SCAN]' >> combined-security-report.txt"
-                if (fileExists('gitleaks-report.txt')) { sh "cat gitleaks-report.txt >> combined-security-report.txt" }
+                if (fileExists('gitleaks-report.txt')) {
+                    sh "cat gitleaks-report.txt >> combined-security-report.txt"
+                }
 
-                echo "--- STEP 2: SENDING TO AI ---"
-                // Read the file content and escape it for JSON
+                echo "--- STEP 2: GENERATING AI REMEDIATION DASHBOARD ---"
+                
+                // Sanitize content for JSON payload
                 def reportContent = readFile('combined-security-report.txt').replaceAll('"', '\\\\"').replaceAll('\n', '\\\\n')
                 
                 withCredentials([string(credentialsId: 'OPENAI_API_KEY', variable: 'OKEY')]) {
+                    // Create the JSON request file
                     sh """
                     cat <<EOF > openai-request.json
                     {
                       "model": "gpt-4o-mini",
                       "messages": [{
                         "role": "user", 
-                        "content": "Generate a high-end HTML security remediation dashboard for King Banana. Project: Juice Shop. Use the following data: ${reportContent}. Requirements: 1. Dark theme (Slate-900). 2. Highlight failing metrics. 3. Provide code fixes. 4. Use Tailwind CSS. Return ONLY HTML."
+                        "content": "You are a Senior DevSecOps Engineer. Analyze this report for 'King Banana': ${reportContent}. Create a professional, vibrant HTML dashboard using Tailwind CSS (Dark Mode). Include: 1. Executive Summary. 2. Critical Vulnerability Alerts. 3. Exact code fixes for XSS and Hardcoded Secrets. 4. Strategic recommendations for the Jenkins pipeline. Return ONLY HTML."
                       }],
-                      "temperature": 0.2
+                      "temperature": 0.3
                     }
                     EOF
-
-                    curl -s https://api.openai.com/v1/chat/completions \
-                      -H "Content-Type: application/json" \
-                      -H "Authorization: Bearer \$OKEY" \
-                      -d @openai-request.json | jq -r '.choices[0].message.content' | sed 's/```html//g' | sed 's/```//g' > security-report.html
                     """
+
+                    // Execute API call and save raw response
+                    sh 'curl -s https://api.openai.com/v1/chat/completions -H "Content-Type: application/json" -H "Authorization: Bearer \$OKEY" -d @openai-request.json | jq -r ".choices[0].message.content" > raw_ai_output.txt'
+
+                    // Clean the HTML from markdown code blocks safely
+                    sh "sed 's/```html//g' raw_ai_output.txt > temp_clean.html"
+                    sh "sed 's/```//g' temp_clean.html > security-report.html"
                 }
             }
             
+            // Publish the visual dashboard
             publishHTML([
                 allowMissing: false,
                 alwaysLinkToLastBuild: true,
@@ -100,7 +131,10 @@ pipeline {
                 reportName: 'AI Security Remediation'
             ])
 
+            // Archive the raw combined report and the final HTML for history
             archiveArtifacts artifacts: 'combined-security-report.txt, security-report.html', allowEmptyArchive: true
+            
+            echo "--- PIPELINE COMPLETE: CHECK THE AI SECURITY REMEDIATION TAB ---"
         }
     }
 }
