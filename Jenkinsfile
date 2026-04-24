@@ -30,7 +30,8 @@ pipeline {
                 }
                 stage('Gitleaks Secrets') {
                     steps {
-                        sh 'gitleaks detect --source . --verbose --redact || true'
+                        // We redirect output to a file so we can capture it later
+                        sh 'gitleaks detect --source . --verbose --redact > gitleaks-report.txt || true'
                     }
                 }
             }
@@ -59,74 +60,48 @@ pipeline {
     post {
         always {
             script {
-                echo "--- STARTING DATA COLLECTION FOR AI ---"
+                echo "--- CONSOLIDATING ALL SECURITY FINDINGS ---"
                 
-                def sonarStatus = "UNKNOWN"
-                
-                // 1. Capture SonarQube Status using your 'sonar-token'
+                // 1. Initialize the combined file
+                sh "echo '========================================' > combined-security-report.txt"
+                sh "echo 'KING BANANA CONSOLIDATED SECURITY REPORT' >> combined-security-report.txt"
+                sh "echo 'Generated: \$(date)' >> combined-security-report.txt"
+                sh "echo '========================================\n' >> combined-security-report.txt"
+
+                // 2. Append SonarQube Results (The API Pull)
+                sh "echo '[SECTION 1: SONARQUBE STATUS]' >> combined-security-report.txt"
                 try {
                     withCredentials([string(credentialsId: 'sonar-token', variable: 'S_TOKEN')]) {
-                        sonarStatus = sh(script: "curl -u ${S_TOKEN}: -s 'http://localhost:9000/api/qualitygates/project_status?projectKey=SAST-Pipeline-Project' | jq -r '.projectStatus.status'", returnStdout: true).trim()
+                        sh "curl -u ${S_TOKEN}: -s 'http://localhost:9000/api/qualitygates/project_status?projectKey=SAST-Pipeline-Project' | jq '.' >> combined-security-report.txt"
                     }
-                } catch (Exception e) { 
-                    echo "Failed to fetch Sonar status: ${e.message}"
-                    sonarStatus = "FETCH_ERROR" 
+                } catch (Exception e) {
+                    sh "echo 'Failed to fetch SonarQube data' >> combined-security-report.txt"
                 }
-                echo "SonarQube Debug: Captured status is [${sonarStatus}]"
+                sh "echo '\n' >> combined-security-report.txt"
 
-                // 2. Capture Semgrep Findings and strip quotes to prevent JSON breakage
-                def semgrepData = "No critical issues detected."
+                // 3. Append Semgrep Findings
+                sh "echo '[SECTION 2: SEMGREP SAST FINDINGS]' >> combined-security-report.txt"
                 if (fileExists('semgrep-report.txt')) {
-                    // This strips out double quotes so they don't break the OpenAI JSON structure
-                    semgrepData = sh(script: "grep -iE 'high|critical|error' semgrep-report.txt | head -n 10 | tr -d '\"' | tr -d \"'\" | tr -d '\n' ", returnStdout: true).trim()
-                    if (semgrepData == "") { semgrepData = "Scan complete: No high-priority findings." }
+                    sh "cat semgrep-report.txt >> combined-security-report.txt"
+                } else {
+                    sh "echo 'Semgrep report not found.' >> combined-security-report.txt"
                 }
-                echo "Semgrep Debug: Captured findings: ${semgrepData}"
+                sh "echo '\n' >> combined-security-report.txt"
 
-                // 3. Call OpenAI using a clean JSON file (Best Practice for SysAdmins)
-                withCredentials([string(credentialsId: 'OPENAI_API_KEY', variable: 'OKEY')]) {
-                    sh """
-                    # Create the JSON payload file safely
-                    cat <<EOF > openai-request.json
-                    {
-                      "model": "gpt-4o-mini",
-                      "messages": [
-                        {
-                          "role": "user", 
-                          "content": "Generate a professional HTML security dashboard for King Banana. Project: Juice Shop. SonarQube Status: ${sonarStatus}. Findings: ${semgrepData}. Use Tailwind CSS. Dark theme. Sections: Risk Summary, Table of Issues, and Remediation. Return ONLY HTML. No markdown."
-                        }
-                      ],
-                      "temperature": 0.2
-                    }
-                    EOF
-
-                    # Send the file to OpenAI
-                    curl -s https://api.openai.com/v1/chat/completions \
-                      -H "Content-Type: application/json" \
-                      -H "Authorization: Bearer \$OKEY" \
-                      -d @openai-request.json | jq -r '.choices[0].message.content' \
-                      | sed 's/```html//g' | sed 's/```//g' > security-report.html
-                    """
+                // 4. Append Gitleaks Findings
+                sh "echo '[SECTION 3: GITLEAKS SECRET SCAN]' >> combined-security-report.txt"
+                if (fileExists('gitleaks-report.txt')) {
+                    sh "cat gitleaks-report.txt >> combined-security-report.txt"
+                } else {
+                    sh "echo 'No Gitleaks report found or no secrets detected.' >> combined-security-report.txt"
                 }
 
-                // 4. Final Fail-Safe: If file is empty or 'null', create a basic message
-                def reportContent = readFile('security-report.html').trim()
-                if (reportContent == "null" || reportContent == "" || !fileExists('security-report.html')) {
-                    sh "echo '<html><body style=\"background:#1a202c;color:white;padding:50px;font-family:sans-serif;\"><h1>AI Analysis Unavailable</h1><p>OpenAI returned no data. Check your API usage/credits.</p></body></html>' > security-report.html"
-                }
+                // 5. Final Print to Console (For quick viewing)
+                sh "cat combined-security-report.txt"
             }
             
-            // 5. Publish to Jenkins Sidebar
-            publishHTML([
-                allowMissing: false,
-                alwaysLinkToLastBuild: true,
-                keepAll: true,
-                reportDir: '.',
-                reportFiles: 'security-report.html',
-                reportName: 'AI Security Remediation'
-            ])
-
-            archiveArtifacts artifacts: 'security-report.html, openai-request.json, *.txt', allowEmptyArchive: true
+            // Archive the file so it appears in the Jenkins UI
+            archiveArtifacts artifacts: 'combined-security-report.txt, *.txt', allowEmptyArchive: true
             cleanWs()
         }
     }
