@@ -49,7 +49,6 @@ pipeline {
                 timeout(time: 5, unit: 'MINUTES') {
                     script {
                         waitForQualityGate()
-                        // Ensures the SonarQube API has updated the status before we pull it
                         sh 'sleep 10' 
                     }
                 }
@@ -64,50 +63,56 @@ pipeline {
                 
                 def sonarStatus = "UNKNOWN"
                 
-                // 1. Capture SonarQube Status using your existing 'sonar-token'
-                withCredentials([string(credentialsId: 'sonar-token', variable: 'S_TOKEN')]) {
-                    // The -u flag uses your token to fix the 401 Unauthorized error
-                    sonarStatus = sh(script: """
-                        curl -u ${S_TOKEN}: -s "http://localhost:9000/api/qualitygates/project_status?projectKey=SAST-Pipeline-Project" | jq -r '.projectStatus.status' || echo 'CONNECTION_FAILED'
-                    """, returnStdout: true).trim()
+                // 1. Capture SonarQube Status using your 'sonar-token'
+                try {
+                    withCredentials([string(credentialsId: 'sonar-token', variable: 'S_TOKEN')]) {
+                        sonarStatus = sh(script: "curl -u ${S_TOKEN}: -s 'http://localhost:9000/api/qualitygates/project_status?projectKey=SAST-Pipeline-Project' | jq -r '.projectStatus.status'", returnStdout: true).trim()
+                    }
+                } catch (Exception e) { 
+                    echo "Failed to fetch Sonar status: ${e.message}"
+                    sonarStatus = "FETCH_ERROR" 
                 }
                 echo "SonarQube Debug: Captured status is [${sonarStatus}]"
 
-                // 2. Capture Semgrep Findings
-                def semgrepData = "No high-risk issues found."
+                // 2. Capture Semgrep Findings and strip quotes to prevent JSON breakage
+                def semgrepData = "No critical issues detected."
                 if (fileExists('semgrep-report.txt')) {
-                    semgrepData = sh(script: "grep -iE 'high|critical|error|vulnerability' semgrep-report.txt | head -n 20", returnStdout: true).trim()
-                    if (semgrepData == "") { semgrepData = "Scan complete: No Critical/High issues detected in logs." }
+                    // This strips out double quotes so they don't break the OpenAI JSON structure
+                    semgrepData = sh(script: "grep -iE 'high|critical|error' semgrep-report.txt | head -n 10 | tr -d '\"' | tr -d \"'\" | tr -d '\n' ", returnStdout: true).trim()
+                    if (semgrepData == "") { semgrepData = "Scan complete: No high-priority findings." }
                 }
                 echo "Semgrep Debug: Captured findings: ${semgrepData}"
 
-                // 3. Construct the OpenAI Prompt
-                def reportPrompt = """
-                Generate a professional HTML security dashboard for King Banana.
-                Project: Juice Shop
-                SonarQube Quality Gate: ${sonarStatus}
-                Semgrep Findings: ${semgrepData}
-                
-                Requirements:
-                - Use Tailwind CSS (CDN).
-                - Dark Theme (Slate-900).
-                - Sections: Security Summary, Risk Table, and Remediation Plan.
-                - Return ONLY raw HTML code. No markdown or backticks.
-                """.replaceAll(/["\\]/, '')
-
-                // 4. OpenAI API Call using 'OPENAI_API_KEY' credential
-                withCredentials([string(credentialsId: 'OPENAI_API_KEY', variable: 'OPENAI_KEY')]) {
+                // 3. Call OpenAI using a clean JSON file (Best Practice for SysAdmins)
+                withCredentials([string(credentialsId: 'OPENAI_API_KEY', variable: 'OKEY')]) {
                     sh """
+                    # Create the JSON payload file safely
+                    cat <<EOF > openai-request.json
+                    {
+                      "model": "gpt-4o-mini",
+                      "messages": [
+                        {
+                          "role": "user", 
+                          "content": "Generate a professional HTML security dashboard for King Banana. Project: Juice Shop. SonarQube Status: ${sonarStatus}. Findings: ${semgrepData}. Use Tailwind CSS. Dark theme. Sections: Risk Summary, Table of Issues, and Remediation. Return ONLY HTML. No markdown."
+                        }
+                      ],
+                      "temperature": 0.2
+                    }
+                    EOF
+
+                    # Send the file to OpenAI
                     curl -s https://api.openai.com/v1/chat/completions \
                       -H "Content-Type: application/json" \
-                      -H "Authorization: Bearer ${OPENAI_KEY}" \
-                      -d '{
-                        "model": "gpt-4o-mini",
-                        "messages": [{"role": "user", "content": "${reportPrompt}"}],
-                        "temperature": 0.2
-                      }' | jq -r '.choices[0].message.content' \
-                         | sed 's/```html//g' | sed 's/```//g' > security-report.html
+                      -H "Authorization: Bearer \$OKEY" \
+                      -d @openai-request.json | jq -r '.choices[0].message.content' \
+                      | sed 's/```html//g' | sed 's/```//g' > security-report.html
                     """
+                }
+
+                // 4. Final Fail-Safe: If file is empty or 'null', create a basic message
+                def reportContent = readFile('security-report.html').trim()
+                if (reportContent == "null" || reportContent == "" || !fileExists('security-report.html')) {
+                    sh "echo '<html><body style=\"background:#1a202c;color:white;padding:50px;font-family:sans-serif;\"><h1>AI Analysis Unavailable</h1><p>OpenAI returned no data. Check your API usage/credits.</p></body></html>' > security-report.html"
                 }
             }
             
@@ -121,7 +126,7 @@ pipeline {
                 reportName: 'AI Security Remediation'
             ])
 
-            archiveArtifacts artifacts: '*.txt, *.html, *.json', allowEmptyArchive: true
+            archiveArtifacts artifacts: 'security-report.html, openai-request.json, *.txt', allowEmptyArchive: true
             cleanWs()
         }
     }
