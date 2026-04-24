@@ -25,7 +25,6 @@ pipeline {
             parallel {
                 stage('Semgrep SAST') {
                     steps {
-                        // We use --text so grep can read it easily later
                         sh 'semgrep scan --config p/security-audit --text --output=semgrep-report.txt || true'
                     }
                 }
@@ -50,7 +49,7 @@ pipeline {
                 timeout(time: 5, unit: 'MINUTES') {
                     script {
                         waitForQualityGate()
-                        // Sleep ensures the SonarQube Database is updated before we curl the API
+                        // Ensures the SonarQube API has updated the status before we pull it
                         sh 'sleep 10' 
                     }
                 }
@@ -61,13 +60,20 @@ pipeline {
     post {
         always {
             script {
-                echo "--- DATA COLLECTION DEBUG ---"
+                echo "--- STARTING DATA COLLECTION FOR AI ---"
                 
-                // 1. Capture SonarQube Status with Fallback
-                def sonarStatus = sh(script: "curl -s http://localhost:9000/api/qualitygates/project_status?projectKey=SAST-Pipeline-Project | jq -r '.projectStatus.status' || echo 'PENDING'", returnStdout: true).trim()
+                def sonarStatus = "UNKNOWN"
+                
+                // 1. Capture SonarQube Status using your existing 'sonar-token'
+                withCredentials([string(credentialsId: 'sonar-token', variable: 'S_TOKEN')]) {
+                    // The -u flag uses your token to fix the 401 Unauthorized error
+                    sonarStatus = sh(script: """
+                        curl -u ${S_TOKEN}: -s "http://localhost:9000/api/qualitygates/project_status?projectKey=SAST-Pipeline-Project" | jq -r '.projectStatus.status' || echo 'CONNECTION_FAILED'
+                    """, returnStdout: true).trim()
+                }
                 echo "SonarQube Debug: Captured status is [${sonarStatus}]"
 
-                // 2. Capture Semgrep Findings with Fallback
+                // 2. Capture Semgrep Findings
                 def semgrepData = "No high-risk issues found."
                 if (fileExists('semgrep-report.txt')) {
                     semgrepData = sh(script: "grep -iE 'high|critical|error|vulnerability' semgrep-report.txt | head -n 20", returnStdout: true).trim()
@@ -79,7 +85,7 @@ pipeline {
                 def reportPrompt = """
                 Generate a professional HTML security dashboard for King Banana.
                 Project: Juice Shop
-                SonarQube Status: ${sonarStatus}
+                SonarQube Quality Gate: ${sonarStatus}
                 Semgrep Findings: ${semgrepData}
                 
                 Requirements:
@@ -89,7 +95,7 @@ pipeline {
                 - Return ONLY raw HTML code. No markdown or backticks.
                 """.replaceAll(/["\\]/, '')
 
-                // 4. OpenAI API Call
+                // 4. OpenAI API Call using 'OPENAI_API_KEY' credential
                 withCredentials([string(credentialsId: 'OPENAI_API_KEY', variable: 'OPENAI_KEY')]) {
                     sh """
                     curl -s https://api.openai.com/v1/chat/completions \
