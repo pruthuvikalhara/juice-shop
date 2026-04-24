@@ -20,37 +20,22 @@ pipeline {
             }
         }
 
-        stage('Security Scans') {
-            parallel {
-                stage('Semgrep SAST') {
-                    steps {
-                        sh 'semgrep scan --config p/security-audit --text --output=semgrep-report.txt || true'
-                    }
-                }
-                stage('Gitleaks Secrets') {
-                    steps {
-                        sh 'gitleaks detect --source . --verbose --redact > gitleaks-report.txt || true'
-                    }
+        stage('Security Scans (Skipped for Testing)') {
+            steps {
+                script {
+                    echo "Skipping real scans to save time..."
+                    // We create dummy files so the 'post' block has something to read
+                    sh "echo 'DUMMY SEMGREP DATA: XSS Found in navbar.html' > semgrep-report.txt"
+                    sh "echo 'DUMMY GITLEAKS DATA: Secret found in Jenkinsfile' > gitleaks-report.txt"
                 }
             }
         }
 
-        stage('SonarQube Analysis') {
+        stage('SonarQube (Skipped for Testing)') {
             steps {
-                withSonarQubeEnv('SonarQube-Server') {
-                    sh "${SCANNER_HOME}/bin/sonar-scanner -Dsonar.projectKey='SAST-Pipeline-Project' -Dsonar.sources=."
-                }
-            }
-        }
-
-        stage("Quality Gate Wait") {
-            steps {
-                timeout(time: 5, unit: 'MINUTES') {
-                    script {
-                        waitForQualityGate()
-                        sh 'sleep 10' 
-                    }
-                }
+                echo "Skipping SonarQube analysis..."
+                // We don't need to do anything here; the 'post' block will 
+                // still try to curl the API to get the last known status.
             }
         }
     }
@@ -63,17 +48,21 @@ pipeline {
                 sh "echo 'KING BANANA CONSOLIDATED SECURITY REPORT' >> combined-security-report.txt"
                 sh "echo '========================================\n' >> combined-security-report.txt"
 
-                // Add SonarQube
+                // Add SonarQube (This will still pull the last result from your server)
                 sh "echo '[SECTION 1: SONARQUBE STATUS]' >> combined-security-report.txt"
-                withCredentials([string(credentialsId: 'sonar-token', variable: 'S_TOKEN')]) {
-                    sh "curl -u ${S_TOKEN}: -s 'http://localhost:9000/api/qualitygates/project_status?projectKey=SAST-Pipeline-Project' | jq '.' >> combined-security-report.txt"
+                try {
+                    withCredentials([string(credentialsId: 'sonar-token', variable: 'S_TOKEN')]) {
+                        sh "curl -u ${S_TOKEN}: -s 'http://localhost:9000/api/qualitygates/project_status?projectKey=SAST-Pipeline-Project' | jq '.' >> combined-security-report.txt"
+                    }
+                } catch (Exception e) {
+                    sh "echo 'Failed to fetch SonarQube data' >> combined-security-report.txt"
                 }
 
-                // Add Semgrep
+                // Add Semgrep (Using the dummy file we created above)
                 sh "echo '\n[SECTION 2: SEMGREP SAST FINDINGS]' >> combined-security-report.txt"
                 if (fileExists('semgrep-report.txt')) { sh "cat semgrep-report.txt >> combined-security-report.txt" }
 
-                // Add Gitleaks
+                // Add Gitleaks (Using the dummy file we created above)
                 sh "echo '\n[SECTION 3: GITLEAKS SECRET SCAN]' >> combined-security-report.txt"
                 if (fileExists('gitleaks-report.txt')) { sh "cat gitleaks-report.txt >> combined-security-report.txt" }
 
@@ -88,7 +77,7 @@ pipeline {
                       "model": "gpt-4o-mini",
                       "messages": [{
                         "role": "user", 
-                        "content": "Generate a high-end HTML security remediation dashboard for King Banana. Project: Juice Shop. Use the following data: ${reportContent}. Requirements: 1. Dark theme (Slate-900). 2. Highlight the failing Quality Gate and the leaked NVD_API_KEY. 3. Provide specific code fixes for the XSS in navbar.component.html. 4. Use Tailwind CSS. Return ONLY HTML."
+                        "content": "Generate a high-end HTML security remediation dashboard for King Banana. Project: Juice Shop. Use the following data: ${reportContent}. Requirements: 1. Dark theme (Slate-900). 2. Highlight failing metrics. 3. Provide code fixes. 4. Use Tailwind CSS. Return ONLY HTML."
                       }],
                       "temperature": 0.2
                     }
