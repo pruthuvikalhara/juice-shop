@@ -65,7 +65,7 @@ pipeline {
                 // Initialize the master report file
                 sh """
                 echo '========================================' > combined-security-report.txt
-                echo 'KING BANANA MASTER SECURITY REPORT' >> combined-security-report.txt
+                echo 'Static Application Security Test Report' >> combined-security-report.txt
                 echo 'Generated: \$(date)' >> combined-security-report.txt
                 echo '========================================\n' >> combined-security-report.txt
                 """
